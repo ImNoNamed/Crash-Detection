@@ -1,0 +1,137 @@
+import cv2
+import mediapipe as mp
+import time
+import winsound
+import urllib.request
+import os
+
+# Inicializar MediaPipe Face Mesh (nueva API)
+BaseOptions = mp.tasks.BaseOptions
+FaceLandmarker = mp.tasks.vision.FaceLandmarker
+FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+# Descargar modelo si no existe
+MODEL_PATH = "face_landmarker.task"
+if not os.path.exists(MODEL_PATH):
+    print("Descargando modelo de Face Landmarker...")
+    url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    urllib.request.urlretrieve(url, MODEL_PATH)
+    print("Modelo descargado.")
+
+options = FaceLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.VIDEO,
+    num_faces=1,
+    output_face_blendshapes=True,
+)
+
+UMBRAL_BLINK = 0.4         # valor de blendshape para considerar ojo cerrado
+TIEMPO_ALERTA = 2.0        # segundos con ojos cerrados para activar alerta
+
+
+def main():
+    landmarker = FaceLandmarker.create_from_options(options)
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: No se pudo abrir la cámara.")
+        return
+
+    print("Cámara activa. Presiona 'q' para salir.")
+    print(f"Se activará una alerta si cierras los ojos por más de {TIEMPO_ALERTA} segundos.")
+
+    ojos_cerrados_desde = None
+    alerta_activa = False
+    frame_timestamp = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)  # espejo
+        h, w, _ = frame.shape
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        frame_timestamp += 33  # ~30fps
+        resultado = landmarker.detect_for_video(mp_image, frame_timestamp)
+
+        estado = "Sin rostro detectado"
+        color_estado = (100, 100, 100)
+
+        if resultado.face_blendshapes and len(resultado.face_blendshapes) > 0:
+            blendshapes = resultado.face_blendshapes[0]
+
+            # Buscar los blendshapes de ojos cerrados
+            ojo_izq_valor = 0.0
+            ojo_der_valor = 0.0
+            for bs in blendshapes:
+                if bs.category_name == "eyeBlinkLeft":
+                    ojo_izq_valor = bs.score
+                elif bs.category_name == "eyeBlinkRight":
+                    ojo_der_valor = bs.score
+
+            promedio_blink = (ojo_izq_valor + ojo_der_valor) / 2.0
+
+            # Dibujar landmarks de los ojos si hay
+            if resultado.face_landmarks and len(resultado.face_landmarks) > 0:
+                landmarks = resultado.face_landmarks[0]
+                ojos_indices = [33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380]
+                for idx in ojos_indices:
+                    x = int(landmarks[idx].x * w)
+                    y = int(landmarks[idx].y * h)
+                    cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+
+            # Mostrar valor de blink
+            cv2.putText(frame, f"Blink: {promedio_blink:.2f}", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            if promedio_blink > UMBRAL_BLINK:
+                # Ojos cerrados
+                if ojos_cerrados_desde is None:
+                    ojos_cerrados_desde = time.time()
+
+                tiempo_cerrados = time.time() - ojos_cerrados_desde
+
+                if tiempo_cerrados >= TIEMPO_ALERTA:
+                    estado = f"ALERTA! Ojos cerrados {tiempo_cerrados:.1f}s"
+                    color_estado = (0, 0, 255)
+
+                    if not alerta_activa:
+                        alerta_activa = True
+                        winsound.Beep(1000, 500)
+                else:
+                    estado = f"Ojos cerrados... {tiempo_cerrados:.1f}s"
+                    color_estado = (0, 165, 255)
+            else:
+                # Ojos abiertos
+                ojos_cerrados_desde = None
+                alerta_activa = False
+                estado = "Ojos abiertos"
+                color_estado = (0, 255, 0)
+        else:
+            ojos_cerrados_desde = None
+            alerta_activa = False
+
+        # Mostrar estado en pantalla
+        cv2.putText(frame, estado, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_estado, 2)
+
+        # Borde rojo si hay alerta
+        if alerta_activa:
+            cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
+
+        cv2.imshow("Detector de Ojos - Presiona Q para salir", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    landmarker.close()
+
+
+if __name__ == "__main__":
+    main()
